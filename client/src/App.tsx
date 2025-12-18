@@ -109,6 +109,7 @@ function formatPrice(value?: number) {
 }
 
 function App() {
+  const socket = useSocket();
   const socketRef = useRef<Socket | null>(null);
   const [step, setStep] = useState<'welcome' | 'setup' | 'play'>('welcome');
   const [playerName, setPlayerName] = useState('');
@@ -131,7 +132,6 @@ function App() {
   const patternRef = useRef<string>(patterns[0]);
 
   useEffect(() => {
-    const socket = useSocket();
     socketRef.current = socket;
 
     socket.on('session_update', (data: SessionState) => {
@@ -152,7 +152,7 @@ function App() {
     return () => {
       socket.disconnect();
     };
-  }, []);
+  }, [socket]);
 
   useEffect(() => {
     if (!market || !chartRef.current) return;
