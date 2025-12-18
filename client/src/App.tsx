@@ -92,7 +92,13 @@ type OrderForm = {
   leverage: number;
 };
 
-const socketUrl = import.meta.env.VITE_SERVER_URL || 'http://localhost:4000';
+const isLocalhost =
+  window.location.hostname === 'localhost' ||
+  window.location.hostname === '127.0.0.1' ||
+  window.location.hostname === '::1';
+const socketUrl =
+  import.meta.env.VITE_SERVER_URL ||
+  (isLocalhost ? 'http://localhost:4000' : window.location.origin);
 
 function useSocket() {
   return useMemo(() => io(socketUrl), []);
