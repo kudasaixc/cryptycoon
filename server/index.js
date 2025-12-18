@@ -106,6 +106,8 @@ function roundBalance(value) {
   return Number(value.toFixed(BALANCE_PRECISION));
 }
 
+let lastRealWorldErrorTs = 0;
+
 async function refreshRealWorldSnapshot() {
   try {
     const ids = Object.values(coingeckoIds).join(',');
@@ -121,8 +123,35 @@ async function refreshRealWorldSnapshot() {
     });
     realWorldSnapshot = { ...prices };
   } catch (error) {
-    // fallback to previous snapshot
-    console.error('Failed to refresh real-world prices, using last snapshot');
+    const now = Date.now();
+    // log at most once per minute to avoid noisy consoles
+    if (now - lastRealWorldErrorTs > 60_000) {
+      console.warn('Failed to refresh real-world prices, falling back to simulated snapshot');
+      lastRealWorldErrorTs = now;
+    }
+    // Try a lightweight Binance fallback for majors to stay close to reality
+    try {
+      const majors = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+      const responses = await Promise.all(
+        majors.map((symbol) =>
+          axios
+            .get(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`)
+            .then((r) => Number(r.data?.price))
+            .catch(() => null)
+        )
+      );
+      const prices = { ...realWorldSnapshot };
+      majors.forEach((symbol, idx) => {
+        const asset = symbol.replace('USDT', '');
+        if (responses[idx]) {
+          prices[asset] = responses[idx];
+        }
+      });
+      realWorldSnapshot = prices;
+    } catch (_) {
+      // keep the previous snapshot; nothing else to do
+      realWorldSnapshot = { ...realWorldSnapshot, ...initialSeedPrices };
+    }
   }
 }
 

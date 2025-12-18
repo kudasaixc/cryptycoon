@@ -46,5 +46,5 @@ VITE_SERVER_URL=http://votre-hote:4000
 4. Si le solde tombe à 0, un faucet de 10 $ est disponible une seule fois.
 
 ## Notes
-- Le mode Real-World interroge l'API publique de CoinGecko ; un accès réseau est requis. En cas d'échec, le jeu conserve le dernier snapshot.
+- Le mode Real-World interroge l'API publique de CoinGecko. En cas d'échec réseau ou de limitation, le serveur bascule sur le dernier snapshot en cache et tente un secours Binance (BTC/ETH/SOL) avant de retomber sur la simulation. Les échecs externes ne sont journalisés qu'une fois par minute pour éviter le spam.
 - Aucun système de login n'est nécessaire : chaque session Socket.IO correspond à une partie.
