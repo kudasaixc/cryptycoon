@@ -132,6 +132,7 @@ function App() {
     leverage: 1,
   });
   const [status, setStatus] = useState<string>('');
+  const [connecting, setConnecting] = useState(false);
   const [timeLeft, setTimeLeft] = useState<string>('15:00');
   const chartRef = useRef<HTMLDivElement | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
@@ -144,6 +145,9 @@ function App() {
       setSession(data);
       setMarket(data.market);
       setPattern();
+      setStep('play');
+      setStatus('');
+      setConnecting(false);
     });
 
     socket.on('market_update', (payload: Partial<MarketState> & { bots?: BotRow[] }) => {
@@ -153,6 +157,19 @@ function App() {
         orderBook: payload.orderBook || prev?.orderBook || {},
       }));
       setSession((prev) => (prev ? { ...prev, bots: payload.bots || prev.bots } : prev));
+    });
+
+    socket.on('connect_error', () => {
+      setStatus('Connexion au serveur impossible. Vérifiez que le backend tourne.');
+      setConnecting(false);
+    });
+
+    socket.on('disconnect', () => {
+      setStatus('Déconnecté du serveur. Relancez la partie pour réessayer.');
+      setSession(null);
+      setMarket(null);
+      setStep('welcome');
+      setConnecting(false);
     });
 
     return () => {
@@ -230,9 +247,9 @@ function App() {
       setStatus('Merci de saisir un nom de joueur.');
       return;
     }
+    setConnecting(true);
+    setStatus('Connexion au serveur...');
     socketRef.current?.emit('start_game', { playerName, difficulty, mode });
-    setStep('play');
-    setStatus('');
   };
 
   const handleOrder = () => {
@@ -339,8 +356,8 @@ function App() {
           <p className="muted">
             Real-World met à jour les cours toutes les 3s avec les marchés réels. Easy, Medium et Hard génèrent leurs propres patterns : falling wedges, fake breakouts et autres surprises.
           </p>
-          <button className="primary" onClick={handleStart}>
-            Lancer la partie
+          <button className="primary" onClick={handleStart} disabled={connecting}>
+            {connecting ? 'Connexion...' : 'Lancer la partie'}
           </button>
           {status && <p className="status">{status}</p>}
         </section>
