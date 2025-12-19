@@ -92,13 +92,33 @@ type OrderForm = {
   leverage: number;
 };
 
-const isLocalhost =
-  window.location.hostname === 'localhost' ||
-  window.location.hostname === '127.0.0.1' ||
-  window.location.hostname === '::1';
-const socketUrl =
-  import.meta.env.VITE_SERVER_URL ||
-  (isLocalhost ? 'http://localhost:4000' : window.location.origin);
+const localHosts = ['localhost', '127.0.0.1', '::1'];
+
+function resolveSocketUrl() {
+  if (import.meta.env.VITE_SERVER_URL) return import.meta.env.VITE_SERVER_URL;
+
+  const { protocol, hostname, port } = window.location;
+
+  if (localHosts.includes(hostname)) {
+    return `${protocol}//${hostname}:4000`;
+  }
+
+  // Handle forwarded dev URLs where the port is encoded in the subdomain (e.g. 5173-myapp.example -> 4000-myapp.example)
+  const subdomainPortMatch = hostname.match(/^(\d+)-(.*)$/);
+  if (subdomainPortMatch) {
+    return `${protocol}//4000-${subdomainPortMatch[2]}`;
+  }
+
+  // Fallback: keep the host and only swap the port when it is explicitly present
+  if (port) {
+    const targetPort = port === '5173' ? '4000' : port;
+    return `${protocol}//${hostname}:${targetPort}`;
+  }
+
+  return `${protocol}//${hostname}`;
+}
+
+const socketUrl = resolveSocketUrl();
 
 function useSocket() {
   return useMemo(() => io(socketUrl), []);
