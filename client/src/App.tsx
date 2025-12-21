@@ -124,7 +124,14 @@ function resolveSocketUrl() {
 const socketUrl = resolveSocketUrl();
 
 function useSocket() {
-  return useMemo(() => io(socketUrl), []);
+  return useMemo(
+    () =>
+      io(socketUrl, {
+        autoConnect: false,
+        transports: ['websocket', 'polling'],
+      }),
+    []
+  );
 }
 
 const formatter = new Intl.NumberFormat('en-US', {
@@ -140,6 +147,7 @@ function formatPrice(value?: number) {
 function App() {
   const socket = useSocket();
   const socketRef = useRef<Socket | null>(null);
+  const pendingStartRef = useRef<(() => void) | null>(null);
   const [step, setStep] = useState<'welcome' | 'setup' | 'play'>('welcome');
   const [playerName, setPlayerName] = useState('');
   const [difficulty, setDifficulty] = useState<Difficulty>('Medium');
@@ -164,15 +172,18 @@ function App() {
 
   useEffect(() => {
     socketRef.current = socket;
+    socket.connect();
     console.info('[network] Attempting socket connection', { url: socketUrl });
 
-    socket.on('connect', () => {
+    const handleConnect = () => {
       console.info('[network] Connected to server', { url: socketUrl, id: socket.id });
       setStatus(`Connecté au serveur (${socketUrl}).`);
-      setConnecting(false);
-    });
+      if (!pendingStartRef.current) {
+        setConnecting(false);
+      }
+    };
 
-    socket.on('session_update', (data: SessionState) => {
+    const handleSessionUpdate = (data: SessionState) => {
       console.info('[network] session_update received', { priceProvider: data.priceProvider, difficulty: data.difficulty });
       setSession(data);
       setMarket(data.market);
@@ -180,9 +191,9 @@ function App() {
       setStep('play');
       setStatus('');
       setConnecting(false);
-    });
+    };
 
-    socket.on('market_update', (payload: Partial<MarketState> & { bots?: BotRow[] }) => {
+    const handleMarketUpdate = (payload: Partial<MarketState> & { bots?: BotRow[] }) => {
       console.info('[network] market_update received', {
         prices: Object.keys(payload.prices || {}).length,
         candles: Object.keys(payload.candles || {}).length,
@@ -193,24 +204,47 @@ function App() {
         orderBook: payload.orderBook || prev?.orderBook || {},
       }));
       setSession((prev) => (prev ? { ...prev, bots: payload.bots || prev.bots } : prev));
-    });
+    };
 
-    socket.on('connect_error', (err) => {
+    const handleConnectError = (err: unknown) => {
       console.error('[network] connect_error', err);
+      if (pendingStartRef.current) {
+        socket.off('connect', pendingStartRef.current);
+        pendingStartRef.current = null;
+      }
       setStatus(`Connexion au serveur impossible (${socketUrl}). Vérifiez que le backend tourne.`);
       setConnecting(false);
-    });
+    };
 
-    socket.on('disconnect', () => {
+    const handleDisconnect = () => {
       console.warn('[network] Socket disconnected');
+      if (pendingStartRef.current) {
+        socket.off('connect', pendingStartRef.current);
+        pendingStartRef.current = null;
+      }
       setStatus('Déconnecté du serveur. Relancez la partie pour réessayer.');
       setSession(null);
       setMarket(null);
       setStep('welcome');
       setConnecting(false);
-    });
+    };
+
+    socket.on('connect', handleConnect);
+    socket.on('session_update', handleSessionUpdate);
+    socket.on('market_update', handleMarketUpdate);
+    socket.on('connect_error', handleConnectError);
+    socket.on('disconnect', handleDisconnect);
 
     return () => {
+      if (pendingStartRef.current) {
+        socket.off('connect', pendingStartRef.current);
+        pendingStartRef.current = null;
+      }
+      socket.off('connect', handleConnect);
+      socket.off('session_update', handleSessionUpdate);
+      socket.off('market_update', handleMarketUpdate);
+      socket.off('connect_error', handleConnectError);
+      socket.off('disconnect', handleDisconnect);
       socket.disconnect();
     };
   }, [socket]);
@@ -285,9 +319,31 @@ function App() {
       setStatus('Merci de saisir un nom de joueur.');
       return;
     }
-    setConnecting(true);
+    const socketClient = socketRef.current || socket;
+    const startGame = () => {
+      setStatus(`Connexion au serveur (${socketUrl}) | Provider prix : ${priceProvider}`);
+      setConnecting(true);
+      socketClient.emit('start_game', { playerName, difficulty, mode, priceProvider });
+    };
+
+    if (socketClient.connected) {
+      startGame();
+      return;
+    }
+
+    if (pendingStartRef.current) {
+      socketClient.off('connect', pendingStartRef.current);
+    }
+
+    const deferredStart = () => {
+      pendingStartRef.current = null;
+      startGame();
+    };
+    pendingStartRef.current = deferredStart;
+    socketClient.on('connect', deferredStart);
+    socketClient.connect();
     setStatus(`Connexion au serveur (${socketUrl}) | Provider prix : ${priceProvider}`);
-    socketRef.current?.emit('start_game', { playerName, difficulty, mode, priceProvider });
+    setConnecting(true);
   };
 
   const handleOrder = () => {
