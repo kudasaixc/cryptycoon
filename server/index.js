@@ -9,6 +9,7 @@ const PORT = process.env.PORT || 4000;
 const TICK_MS = 3000;
 const PRICE_PRECISION = 4;
 const BALANCE_PRECISION = 2;
+const priceProviders = ['internal', 'coingecko', 'binance'];
 
 const app = express();
 app.use(cors());
@@ -82,7 +83,11 @@ const initialSeedPrices = {
 };
 
 const sessions = new Map();
-let realWorldSnapshot = { ...initialSeedPrices };
+const priceSnapshots = {
+  internal: { ...initialSeedPrices },
+  coingecko: { ...initialSeedPrices },
+  binance: { ...initialSeedPrices },
+};
 
 const botNames = [
   'AlphaWhale',
@@ -117,12 +122,17 @@ function roundBalance(value) {
 
 let lastRealWorldErrorTs = 0;
 
-function logRefreshError(message) {
+function logRefreshError(message, meta = {}) {
   const now = Date.now();
   if (now - lastRealWorldErrorTs > 60_000) {
-    console.warn(message);
+    console.warn(message, Object.keys(meta).length ? meta : '');
     lastRealWorldErrorTs = now;
   }
+}
+
+function logNetwork(scope, message, meta = {}) {
+  const payload = Object.keys(meta).length ? meta : undefined;
+  console.log(`[${new Date().toISOString()}][${scope}] ${message}`, payload || '');
 }
 
 async function fetchBinanceSnapshot() {
@@ -166,22 +176,58 @@ async function fetchCoingeckoSnapshot() {
   return prices;
 }
 
-async function refreshRealWorldSnapshot() {
-  try {
-    const binanceSnapshot = await fetchBinanceSnapshot();
-    realWorldSnapshot = { ...initialSeedPrices, ...binanceSnapshot };
+function mutateInternalSnapshot(snapshot) {
+  const updated = {};
+  Object.entries(snapshot).forEach(([symbol, value]) => {
+    const drift = (Math.random() * 0.01 - 0.005) * value;
+    updated[symbol] = roundPrice(Math.max(0.0001, value + drift));
+  });
+  return updated;
+}
+
+async function refreshProviderSnapshot(provider) {
+  if (provider === 'internal') {
+    priceSnapshots.internal = { ...initialSeedPrices, ...mutateInternalSnapshot(priceSnapshots.internal) };
+    logNetwork('prices', 'Internal price snapshot updated (simulated)');
     return;
-  } catch (error) {
-    logRefreshError('Failed to refresh Binance prices, attempting CoinGecko fallback');
   }
 
-  try {
-    const coingeckoSnapshot = await fetchCoingeckoSnapshot();
-    realWorldSnapshot = { ...initialSeedPrices, ...coingeckoSnapshot };
-  } catch (error) {
-    logRefreshError('Failed to refresh real-world prices, falling back to simulated snapshot');
-    realWorldSnapshot = { ...realWorldSnapshot, ...initialSeedPrices };
+  if (provider === 'binance') {
+    logNetwork('prices', 'Refreshing Binance snapshot');
+    try {
+      const binanceSnapshot = await fetchBinanceSnapshot();
+      priceSnapshots.binance = { ...initialSeedPrices, ...binanceSnapshot };
+      logNetwork('prices', 'Binance snapshot updated', { assets: Object.keys(binanceSnapshot).length });
+      return;
+    } catch (error) {
+      logRefreshError('Failed to refresh Binance prices', { error: error?.message });
+    }
   }
+
+  if (provider === 'coingecko') {
+    logNetwork('prices', 'Refreshing CoinGecko snapshot');
+    try {
+      const coingeckoSnapshot = await fetchCoingeckoSnapshot();
+      priceSnapshots.coingecko = { ...initialSeedPrices, ...coingeckoSnapshot };
+      logNetwork('prices', 'CoinGecko snapshot updated', { assets: Object.keys(coingeckoSnapshot).length });
+      return;
+    } catch (error) {
+      logRefreshError('Failed to refresh CoinGecko prices', { error: error?.message });
+    }
+  }
+
+  logRefreshError('Unknown provider requested', { provider });
+}
+
+async function refreshPriceSnapshots(requestedProviders = []) {
+  const uniqueProviders = Array.from(new Set(requestedProviders));
+  if (!uniqueProviders.length) return;
+
+  await Promise.all(
+    uniqueProviders.map(async (provider) => {
+      await refreshProviderSnapshot(provider);
+    })
+  );
 }
 
 function generateInitialCandles(price) {
@@ -200,12 +246,14 @@ function generateInitialCandles(price) {
 
 function createSession(socketId, payload) {
   const { playerName, difficulty, mode } = payload;
+  const priceProvider = priceProviders.includes(payload.priceProvider) ? payload.priceProvider : 'internal';
   const startingBalance = mode === 'Admin' ? 10000 : mode === 'Whale' ? 25000 : 1000;
   const session = {
     id: socketId,
     playerName,
     difficulty,
     mode,
+    priceProvider,
     holdings: { USD: startingBalance },
     positions: [],
     realizedPnl: 0,
@@ -214,14 +262,15 @@ function createSession(socketId, payload) {
     startedAt: Date.now(),
     faucetClaimed: false,
     selectedAsset: 'BTC',
-    market: buildInitialMarket(difficulty),
+    market: buildInitialMarket(difficulty, priceProvider),
   };
   sessions.set(socketId, session);
   return session;
 }
 
-function buildInitialMarket(difficulty) {
-  const basePrices = difficulty === 'Real-World' ? realWorldSnapshot : initialSeedPrices;
+function buildInitialMarket(difficulty, priceProvider) {
+  const snapshot = priceSnapshots[priceProvider] || priceSnapshots.internal;
+  const basePrices = difficulty === 'Real-World' ? snapshot : initialSeedPrices;
   const prices = { ...basePrices };
   const candles = {};
   assets.forEach((asset) => {
@@ -414,6 +463,7 @@ function sanitizeSession(session) {
     playerName: session.playerName,
     difficulty: session.difficulty,
     mode: session.mode,
+    priceProvider: session.priceProvider,
     holdings: session.holdings,
     positions: session.positions,
     realizedPnl: session.realizedPnl,
@@ -426,7 +476,13 @@ function sanitizeSession(session) {
 }
 
 async function tick() {
-  await refreshRealWorldSnapshot();
+  const requestedProviders = [];
+  sessions.forEach((session) => {
+    if (session.difficulty === 'Real-World') {
+      requestedProviders.push(session.priceProvider || 'internal');
+    }
+  });
+  await refreshPriceSnapshots(requestedProviders);
   sessions.forEach((session, socketId) => {
     const socket = io.sockets.sockets.get(socketId);
     if (!socket) return;
@@ -436,8 +492,15 @@ async function tick() {
       if (!prices[asset]) return;
       const current = prices[asset];
       let nextPrice = current;
-      if (difficulty === 'Real-World' && realWorldSnapshot[asset]) {
-        nextPrice = realWorldSnapshot[asset];
+      if (difficulty === 'Real-World') {
+        const providerSnapshot =
+          priceSnapshots[session.priceProvider] ||
+          priceSnapshots.binance ||
+          priceSnapshots.coingecko ||
+          priceSnapshots.internal;
+        if (providerSnapshot?.[asset]) {
+          nextPrice = providerSnapshot[asset];
+        }
       } else {
         const bias = session.positions.some((p) => p.symbol === asset)
           ? session.positions.reduce((acc, p) => (p.symbol === asset ? acc + (p.side === 'long' ? -0.002 : 0.002) : acc), 0)
@@ -462,12 +525,20 @@ async function tick() {
 }
 
 io.on('connection', (socket) => {
+  logNetwork('socket', 'Client connected', {
+    socketId: socket.id,
+    address: socket.handshake?.address,
+    headers: socket.handshake?.headers,
+  });
+
   socket.on('start_game', (payload) => {
+    logNetwork('socket', 'start_game received', { socketId: socket.id, payload });
     const session = createSession(socket.id, payload);
     emitSession(socket, session);
   });
 
   socket.on('place_order', (order, callback) => {
+    logNetwork('socket', 'place_order received', { socketId: socket.id, order });
     const session = sessions.get(socket.id);
     if (!session) return;
     const result = handleOrder(session, order);
@@ -477,6 +548,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('claim_faucet', () => {
+    logNetwork('socket', 'claim_faucet received', { socketId: socket.id });
     const session = sessions.get(socket.id);
     if (!session || session.faucetClaimed) return;
     if (session.holdings.USD <= 0) {
@@ -487,12 +559,15 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
+    logNetwork('socket', 'Client disconnected', { socketId: socket.id });
     sessions.delete(socket.id);
   });
 });
 
-setInterval(tick, TICK_MS);
+setInterval(() => {
+  tick().catch((error) => logRefreshError('Tick execution failed', { error: error?.message }));
+}, TICK_MS);
 
 httpServer.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  logNetwork('server', `Server listening on port ${PORT}`, { port: PORT });
 });
