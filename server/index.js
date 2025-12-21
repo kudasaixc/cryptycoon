@@ -48,6 +48,15 @@ const coingeckoIds = {
   SOL: 'solana',
 };
 
+const binanceSymbols = {
+  BTC: 'BTCUSDT',
+  ETH: 'ETHUSDT',
+  ICP: 'ICPUSDT',
+  DASH: 'DASHUSDT',
+  NEAR: 'NEARUSDT',
+  SOL: 'SOLUSDT',
+};
+
 const fiatFallback = {
   USD: 1,
   EUR: 0.92,
@@ -108,50 +117,70 @@ function roundBalance(value) {
 
 let lastRealWorldErrorTs = 0;
 
+function logRefreshError(message) {
+  const now = Date.now();
+  if (now - lastRealWorldErrorTs > 60_000) {
+    console.warn(message);
+    lastRealWorldErrorTs = now;
+  }
+}
+
+async function fetchBinanceSnapshot() {
+  const prices = {};
+  await Promise.all(
+    Object.entries(binanceSymbols).map(async ([asset, symbol]) => {
+      try {
+        const { data } = await axios.get('https://api.binance.com/api/v3/ticker/price', {
+          params: { symbol },
+        });
+        const parsed = Number(data?.price);
+        if (Number.isFinite(parsed)) {
+          prices[asset] = parsed;
+        }
+      } catch (err) {
+        // ignore symbol-specific failures and continue with others
+      }
+    })
+  );
+  if (!Object.keys(prices).length) {
+    throw new Error('Binance prices unavailable');
+  }
+  return prices;
+}
+
+async function fetchCoingeckoSnapshot() {
+  const ids = Object.values(coingeckoIds).join(',');
+  const response = await axios.get(
+    `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd`
+  );
+  const prices = {};
+  Object.entries(coingeckoIds).forEach(([symbol, id]) => {
+    const usdPrice = response.data?.[id]?.usd;
+    if (usdPrice) {
+      prices[symbol] = usdPrice;
+    }
+  });
+  if (!Object.keys(prices).length) {
+    throw new Error('CoinGecko prices unavailable');
+  }
+  return prices;
+}
+
 async function refreshRealWorldSnapshot() {
   try {
-    const ids = Object.values(coingeckoIds).join(',');
-    const response = await axios.get(
-      `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd`
-    );
-    const prices = { ...initialSeedPrices };
-    Object.entries(coingeckoIds).forEach(([symbol, id]) => {
-      const usdPrice = response.data?.[id]?.usd;
-      if (usdPrice) {
-        prices[symbol] = usdPrice;
-      }
-    });
-    realWorldSnapshot = { ...prices };
+    const binanceSnapshot = await fetchBinanceSnapshot();
+    realWorldSnapshot = { ...initialSeedPrices, ...binanceSnapshot };
+    return;
   } catch (error) {
-    const now = Date.now();
-    // log at most once per minute to avoid noisy consoles
-    if (now - lastRealWorldErrorTs > 60_000) {
-      console.warn('Failed to refresh real-world prices, falling back to simulated snapshot');
-      lastRealWorldErrorTs = now;
-    }
-    // Try a lightweight Binance fallback for majors to stay close to reality
-    try {
-      const majors = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
-      const responses = await Promise.all(
-        majors.map((symbol) =>
-          axios
-            .get(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`)
-            .then((r) => Number(r.data?.price))
-            .catch(() => null)
-        )
-      );
-      const prices = { ...realWorldSnapshot };
-      majors.forEach((symbol, idx) => {
-        const asset = symbol.replace('USDT', '');
-        if (responses[idx]) {
-          prices[asset] = responses[idx];
-        }
-      });
-      realWorldSnapshot = prices;
-    } catch (_) {
-      // keep the previous snapshot; nothing else to do
-      realWorldSnapshot = { ...realWorldSnapshot, ...initialSeedPrices };
-    }
+    logRefreshError('Failed to refresh Binance prices, attempting CoinGecko fallback');
+  }
+
+  try {
+    const coingeckoSnapshot = await fetchCoingeckoSnapshot();
+    realWorldSnapshot = { ...initialSeedPrices, ...coingeckoSnapshot };
+  } catch (error) {
+    logRefreshError('Failed to refresh real-world prices, falling back to simulated snapshot');
+    realWorldSnapshot = { ...realWorldSnapshot, ...initialSeedPrices };
   }
 }
 
