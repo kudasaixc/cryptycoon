@@ -30,9 +30,11 @@ const patterns = [
 
 const difficulties = ['Real-World', 'Easy', 'Medium', 'Hard'] as const;
 const modes = ['EZ-Mode', 'Admin', 'Whale'] as const;
+const priceProviders = ['internal', 'coingecko', 'binance'] as const;
 
 type Difficulty = (typeof difficulties)[number];
 type Mode = (typeof modes)[number];
+type PriceProvider = (typeof priceProviders)[number];
 
 type Candle = {
   time: number;
@@ -74,6 +76,7 @@ type SessionState = {
   playerName: string;
   difficulty: Difficulty;
   mode: Mode;
+  priceProvider: PriceProvider;
   holdings: Record<string, number>;
   positions: Position[];
   realizedPnl: number;
@@ -141,6 +144,7 @@ function App() {
   const [playerName, setPlayerName] = useState('');
   const [difficulty, setDifficulty] = useState<Difficulty>('Medium');
   const [mode, setMode] = useState<Mode>('EZ-Mode');
+  const [priceProvider, setPriceProvider] = useState<PriceProvider>('internal');
   const [session, setSession] = useState<SessionState | null>(null);
   const [market, setMarket] = useState<MarketState | null>(null);
   const [selectedAsset, setSelectedAsset] = useState('BTC');
@@ -160,8 +164,16 @@ function App() {
 
   useEffect(() => {
     socketRef.current = socket;
+    console.info('[network] Attempting socket connection', { url: socketUrl });
+
+    socket.on('connect', () => {
+      console.info('[network] Connected to server', { url: socketUrl, id: socket.id });
+      setStatus(`Connecté au serveur (${socketUrl}).`);
+      setConnecting(false);
+    });
 
     socket.on('session_update', (data: SessionState) => {
+      console.info('[network] session_update received', { priceProvider: data.priceProvider, difficulty: data.difficulty });
       setSession(data);
       setMarket(data.market);
       setPattern();
@@ -171,6 +183,10 @@ function App() {
     });
 
     socket.on('market_update', (payload: Partial<MarketState> & { bots?: BotRow[] }) => {
+      console.info('[network] market_update received', {
+        prices: Object.keys(payload.prices || {}).length,
+        candles: Object.keys(payload.candles || {}).length,
+      });
       setMarket((prev) => ({
         prices: payload.prices || prev?.prices || {},
         candles: payload.candles || prev?.candles || {},
@@ -179,12 +195,14 @@ function App() {
       setSession((prev) => (prev ? { ...prev, bots: payload.bots || prev.bots } : prev));
     });
 
-    socket.on('connect_error', () => {
-      setStatus('Connexion au serveur impossible. Vérifiez que le backend tourne.');
+    socket.on('connect_error', (err) => {
+      console.error('[network] connect_error', err);
+      setStatus(`Connexion au serveur impossible (${socketUrl}). Vérifiez que le backend tourne.`);
       setConnecting(false);
     });
 
     socket.on('disconnect', () => {
+      console.warn('[network] Socket disconnected');
       setStatus('Déconnecté du serveur. Relancez la partie pour réessayer.');
       setSession(null);
       setMarket(null);
@@ -268,8 +286,8 @@ function App() {
       return;
     }
     setConnecting(true);
-    setStatus('Connexion au serveur...');
-    socketRef.current?.emit('start_game', { playerName, difficulty, mode });
+    setStatus(`Connexion au serveur (${socketUrl}) | Provider prix : ${priceProvider}`);
+    socketRef.current?.emit('start_game', { playerName, difficulty, mode, priceProvider });
   };
 
   const handleOrder = () => {
@@ -331,6 +349,7 @@ function App() {
         <div className="meta">
           <span className="pill">Difficulté : {difficulty}</span>
           <span className="pill">Mode : {mode}</span>
+          <span className="pill">API Prix : {session?.priceProvider || priceProvider}</span>
           <span className="pill">Timer : {timeLeft}</span>
         </div>
       </header>
@@ -372,9 +391,25 @@ function App() {
                 ))}
               </select>
             </label>
+            <label>
+              Source des prix
+              <select
+                value={priceProvider}
+                onChange={(e) => setPriceProvider(e.target.value as PriceProvider)}
+              >
+                {priceProviders.map((provider) => (
+                  <option key={provider} value={provider}>
+                    {provider === 'internal' ? 'Interne (sans API externe)' : provider}
+                  </option>
+                ))}
+              </select>
+            </label>
           </div>
           <p className="muted">
             Real-World met à jour les cours toutes les 3s avec les marchés réels. Easy, Medium et Hard génèrent leurs propres patterns : falling wedges, fake breakouts et autres surprises.
+          </p>
+          <p className="muted">
+            Serveur ciblé : <code>{socketUrl}</code>. Choisissez "Interne" si les API Binance ou CoinGecko sont injoignables.
           </p>
           <button className="primary" onClick={handleStart} disabled={connecting}>
             {connecting ? 'Connexion...' : 'Lancer la partie'}
