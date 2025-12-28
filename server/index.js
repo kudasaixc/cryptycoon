@@ -41,6 +41,8 @@ const assets = [
   'TRY',
 ];
 
+const stableAssets = new Set(['USD', 'USDT', 'EUR', 'JPY', 'CNY', 'TRY']);
+
 const coingeckoIds = {
   BTC: 'bitcoin',
   ETH: 'ethereum',
@@ -213,6 +215,10 @@ async function fetchCoingeckoSnapshot() {
 function mutateInternalSnapshot(snapshot) {
   const updated = {};
   Object.entries(snapshot).forEach(([symbol, value]) => {
+    if (stableAssets.has(symbol)) {
+      updated[symbol] = roundPrice(initialSeedPrices[symbol] ?? value);
+      return;
+    }
     const drift = (Math.random() * 0.01 - 0.005) * value;
     updated[symbol] = roundPrice(Math.max(0.0001, value + drift));
   });
@@ -296,7 +302,7 @@ function generateInitialCandles(price) {
 
 function createSession(socketId, payload) {
   const { playerName, difficulty, mode } = payload;
-  const priceProvider = priceProviders.includes(payload.priceProvider) ? payload.priceProvider : 'internal';
+  const priceProvider = priceProviders.includes(payload.priceProvider) ? payload.priceProvider : 'binance';
   const startingBalance = mode === 'Admin' ? 10000 : mode === 'Whale' ? 25000 : 1000;
   const session = {
     id: socketId,
@@ -373,7 +379,8 @@ function mergeOrderBooks(prices, providerBooks = null) {
   return merged;
 }
 
-function applyDifficultyDrift(price, difficulty, bias = 0) {
+function applyDifficultyDrift(price, difficulty, bias = 0, symbol = '') {
+  if (stableAssets.has(symbol)) return price;
   const roll = Math.random();
   if (difficulty === 'Easy') {
     const step = (Math.random() * 0.004 + 0.001 + bias) * price;
@@ -610,7 +617,7 @@ async function tick() {
         const bias = session.positions.some((p) => p.symbol === asset)
           ? session.positions.reduce((acc, p) => (p.symbol === asset ? acc + (p.side === 'long' ? -0.002 : 0.002) : acc), 0)
           : 0;
-        nextPrice = applyDifficultyDrift(current, difficulty, bias);
+        nextPrice = applyDifficultyDrift(current, difficulty, bias, asset);
       }
       nextPrice = Math.max(0.0001, nextPrice);
       prices[asset] = roundPrice(nextPrice);

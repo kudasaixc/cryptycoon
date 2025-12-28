@@ -21,11 +21,11 @@ const assets = [
 ];
 
 const patterns = [
-  'Falling wedge spotted – watch for a fake breakout.',
-  'Ascending wedge forming – pressure building on bulls.',
-  'Fake breakout just happened, volume drying up.',
-  'Sideways chop – stay patient, avoid FOMO.',
-  'Momentum spike incoming – scale in slowly.',
+  'Flux en direct alimenté par des données d\'échange réelles.',
+  'Données temps réel : aucune prédiction, juste le marché.',
+  'Pas de signaux programmés – tradez ce que vous voyez.',
+  'Order book et prix synchronisés avec le fournisseur sélectionné.',
+  'Expérience type broker : transparence et prix bruts.',
 ];
 
 const difficulties = ['Real-World', 'Easy', 'Medium', 'Hard'] as const;
@@ -151,9 +151,9 @@ function App() {
   const pendingStartRef = useRef<(() => void) | null>(null);
   const [step, setStep] = useState<'welcome' | 'setup' | 'play'>('welcome');
   const [playerName, setPlayerName] = useState('');
-  const [difficulty, setDifficulty] = useState<Difficulty>('Medium');
+  const [difficulty, setDifficulty] = useState<Difficulty>('Real-World');
   const [mode, setMode] = useState<Mode>('EZ-Mode');
-  const [priceProvider, setPriceProvider] = useState<PriceProvider>('internal');
+  const [priceProvider, setPriceProvider] = useState<PriceProvider>('binance');
   const [session, setSession] = useState<SessionState | null>(null);
   const [market, setMarket] = useState<MarketState | null>(null);
   const [selectedAsset, setSelectedAsset] = useState('BTC');
@@ -170,7 +170,7 @@ function App() {
   const chartRef = useRef<HTMLDivElement | null>(null);
   const chartInstanceRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
-  const patternRef = useRef<string>(patterns[0]);
+  const patternRef = useRef<string>('Flux marché en direct, sans scénario.');
 
   useEffect(() => {
     socketRef.current = socket;
@@ -189,7 +189,7 @@ function App() {
       console.info('[network] session_update received', { priceProvider: data.priceProvider, difficulty: data.difficulty });
       setSession(data);
       setMarket(data.market);
-      setPattern();
+      setPattern(data);
       setStep('play');
       setStatus('');
       setConnecting(false);
@@ -335,7 +335,11 @@ function App() {
     chartInstanceRef.current?.timeScale().fitContent();
   }, [market, selectedAsset]);
 
-  const setPattern = () => {
+  const setPattern = (nextSession?: SessionState | null) => {
+    if (nextSession?.difficulty === 'Real-World') {
+      patternRef.current = `Flux en direct (${nextSession.priceProvider})`;
+      return;
+    }
     const choice = patterns[Math.floor(Math.random() * patterns.length)];
     patternRef.current = choice;
   };
@@ -546,7 +550,7 @@ function App() {
             </label>
           </div>
           <p className="muted">
-            Real-World met à jour les cours toutes les 3s avec les marchés réels. Easy, Medium et Hard génèrent leurs propres patterns : falling wedges, fake breakouts et autres surprises.
+            Real-World met à jour les cours toutes les 3s avec les marchés réels. Les modes Easy, Medium et Hard restent des simulations libres sans événements scénarisés.
           </p>
           <p className="muted">
             Serveur ciblé : <code>{socketUrl}</code>. Choisissez "Interne" si les API Binance ou CoinGecko sont injoignables.
