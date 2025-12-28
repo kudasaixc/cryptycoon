@@ -10,6 +10,9 @@ const TICK_MS = 3000;
 const PRICE_PRECISION = 4;
 const BALANCE_PRECISION = 2;
 const priceProviders = ['internal', 'coingecko', 'binance'];
+const orderBookSnapshots = {
+  binance: {},
+};
 
 const app = express();
 app.use(cors());
@@ -122,6 +125,15 @@ function roundBalance(value) {
 
 let lastRealWorldErrorTs = 0;
 
+function resolveBinanceSymbol(symbol) {
+  const normalized = symbol?.toUpperCase();
+  const mapped = binanceSymbols[normalized];
+  if (mapped) return mapped;
+  if (normalized && normalized.endsWith('USDT')) return normalized;
+  if (normalized) return `${normalized}USDT`;
+  return null;
+}
+
 function logRefreshError(message, meta = {}) {
   const now = Date.now();
   if (now - lastRealWorldErrorTs > 60_000) {
@@ -156,6 +168,28 @@ async function fetchBinanceSnapshot() {
     throw new Error('Binance prices unavailable');
   }
   return prices;
+}
+
+async function fetchBinanceOrderBook(symbol) {
+  const resolved = resolveBinanceSymbol(symbol);
+  if (!resolved) throw new Error('Invalid symbol for Binance order book');
+
+  const { data } = await axios.get('https://api.binance.com/api/v3/depth', {
+    params: { symbol: resolved, limit: 20 },
+  });
+  const mapRows = (rows = []) =>
+    rows
+      .slice(0, 15)
+      .map(([price, qty]) => ({
+        price: roundPrice(Number(price)),
+        size: roundBalance(Number(qty)),
+      }))
+      .filter((row) => Number.isFinite(row.price) && Number.isFinite(row.size) && row.size > 0);
+
+  return {
+    bids: mapRows(data?.bids),
+    asks: mapRows(data?.asks),
+  };
 }
 
 async function fetchCoingeckoSnapshot() {
@@ -226,6 +260,22 @@ async function refreshPriceSnapshots(requestedProviders = []) {
   await Promise.all(
     uniqueProviders.map(async (provider) => {
       await refreshProviderSnapshot(provider);
+    })
+  );
+}
+
+async function refreshBinanceOrderBooks(assetList = []) {
+  const uniqueAssets = Array.from(new Set(assetList)).filter((asset) => resolveBinanceSymbol(asset));
+  if (!uniqueAssets.length) return;
+
+  await Promise.all(
+    uniqueAssets.map(async (asset) => {
+      try {
+        const book = await fetchBinanceOrderBook(asset);
+        orderBookSnapshots.binance[asset] = book;
+      } catch (error) {
+        logRefreshError('Failed to refresh Binance order book', { asset, error: error?.message });
+      }
     })
   );
 }
@@ -307,6 +357,22 @@ function buildOrderBook(prices) {
   return book;
 }
 
+function mergeOrderBooks(prices, providerBooks = null) {
+  const synthetic = buildOrderBook(prices);
+  if (!providerBooks) return synthetic;
+  const merged = { ...synthetic };
+
+  Object.entries(providerBooks).forEach(([symbol, book]) => {
+    if (book?.bids?.length && book?.asks?.length) {
+      merged[symbol] = {
+        bids: book.bids,
+        asks: book.asks,
+      };
+    }
+  });
+  return merged;
+}
+
 function applyDifficultyDrift(price, difficulty, bias = 0) {
   const roll = Math.random();
   if (difficulty === 'Easy') {
@@ -350,15 +416,17 @@ function updateCandles(candles, symbol, newPrice) {
 function markToMarket(session) {
   let unrealized = 0;
   session.positions.forEach((pos) => {
-    const { symbol, quantity, entryPrice, leverage, side } = pos;
-    const px = session.market.prices[symbol] || entryPrice;
-    const pnl = side === 'long' ? (px - entryPrice) * quantity : (entryPrice - px) * quantity;
+    const { symbol, quantity, entryPrice, leverage, side, quote } = pos;
+    const basePx = session.market.prices[symbol] || entryPrice;
+    const quotePx = session.market.prices[quote] || 1;
+    const pairPrice = basePx / quotePx;
+    const pnl = side === 'long' ? (pairPrice - entryPrice) * quantity : (entryPrice - pairPrice) * quantity;
     const leveraged = pnl * leverage;
     unrealized += leveraged;
     const liquidationPrice = side === 'long'
       ? entryPrice * (1 - 1 / leverage)
       : entryPrice * (1 + 1 / leverage);
-    if ((side === 'long' && px <= liquidationPrice) || (side === 'short' && px >= liquidationPrice)) {
+    if ((side === 'long' && pairPrice <= liquidationPrice) || (side === 'short' && pairPrice >= liquidationPrice)) {
       session.realizedPnl -= pos.margin;
       pos.margin = 0;
       pos.quantity = 0;
@@ -416,7 +484,7 @@ function handleOrder(session, order) {
   }
 
   const positionSide = side === 'buy' ? 'long' : 'short';
-  const existing = session.positions.find((p) => p.symbol === base && p.side === positionSide);
+  const existing = session.positions.find((p) => p.symbol === base && p.side === positionSide && p.quote === quote);
   if (existing) {
     const totalQty = existing.quantity + size;
     existing.entryPrice = roundPrice((existing.entryPrice * existing.quantity + pairPrice * size) / totalQty);
@@ -426,6 +494,7 @@ function handleOrder(session, order) {
   } else {
     session.positions.push({
       symbol: base,
+      quote,
       side: positionSide,
       entryPrice: roundPrice(pairPrice),
       quantity: size,
@@ -434,6 +503,35 @@ function handleOrder(session, order) {
     });
   }
   return { convertedFromUsd, pairPrice: roundPrice(pairPrice) };
+}
+
+function closePosition(session, payload = {}) {
+  const { symbol, side } = payload;
+  if (!symbol) return { error: 'Symbol is required to close a position' };
+
+  const matches = session.positions.filter(
+    (p) => p.symbol === symbol && (!side || p.side === side)
+  );
+  if (!matches.length) return { error: 'No matching position found' };
+
+  matches.forEach((pos) => {
+    const basePx = session.market.prices[pos.symbol] || pos.entryPrice;
+    const quotePx = session.market.prices[pos.quote] || 1;
+    const pairPrice = basePx / quotePx;
+    const pnl = pos.side === 'long'
+      ? (pairPrice - pos.entryPrice) * pos.quantity
+      : (pos.entryPrice - pairPrice) * pos.quantity;
+    const realized = pnl * pos.leverage;
+    session.realizedPnl = roundBalance(session.realizedPnl + realized);
+    session.holdings[pos.quote] = roundBalance((session.holdings[pos.quote] || 0) + pos.margin + realized);
+  });
+
+  session.positions = session.positions.filter(
+    (p) => !(p.symbol === symbol && (!side || p.side === side))
+  );
+  markToMarket(session);
+
+  return { closed: matches.length };
 }
 
 function updateBots(session) {
@@ -477,12 +575,19 @@ function sanitizeSession(session) {
 
 async function tick() {
   const requestedProviders = [];
+  const binanceOrderBookAssets = new Set();
   sessions.forEach((session) => {
     if (session.difficulty === 'Real-World') {
       requestedProviders.push(session.priceProvider || 'internal');
+      if (session.priceProvider === 'binance') {
+        Object.keys(binanceSymbols).forEach((asset) => binanceOrderBookAssets.add(asset));
+      }
     }
   });
-  await refreshPriceSnapshots(requestedProviders);
+  await Promise.all([
+    refreshPriceSnapshots(requestedProviders),
+    refreshBinanceOrderBooks(Array.from(binanceOrderBookAssets)),
+  ]);
   sessions.forEach((session, socketId) => {
     const socket = io.sockets.sockets.get(socketId);
     if (!socket) return;
@@ -512,7 +617,10 @@ async function tick() {
       updateCandles(session.market.candles, asset, prices[asset]);
     });
     session.market.prices = prices;
-    session.market.orderBook = buildOrderBook(prices);
+    const providerBook = session.difficulty === 'Real-World' && session.priceProvider === 'binance'
+      ? orderBookSnapshots.binance
+      : null;
+    session.market.orderBook = mergeOrderBooks(prices, providerBook);
     updateBots(session);
     markToMarket(session);
     socket.emit('market_update', {
@@ -543,6 +651,15 @@ io.on('connection', (socket) => {
     if (!session) return;
     const result = handleOrder(session, order);
     markToMarket(session);
+    emitSession(socket, session);
+    if (callback) callback(result);
+  });
+
+  socket.on('close_position', (payload, callback) => {
+    logNetwork('socket', 'close_position received', { socketId: socket.id, payload });
+    const session = sessions.get(socket.id);
+    if (!session) return;
+    const result = closePosition(session, payload);
     emitSession(socket, session);
     if (callback) callback(result);
   });
